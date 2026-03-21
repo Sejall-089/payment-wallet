@@ -1,0 +1,22 @@
+# Maven build output — compiled classes, packaged jar
+target/
+
+# IntelliJ project files — these are machine-specific
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Spring Boot config with secrets — never commit real secrets
+application-prod.yml
+
+# Logs
+*.log
+logs/
+
+# Docker volumes
+postgres_data/
