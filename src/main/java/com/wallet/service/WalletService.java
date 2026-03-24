@@ -54,23 +54,26 @@ public class WalletService {
                 .build();
 
         transactionRepository.save(txn);
-        return toTransactionResponse(txn);
+        return toTransactionResponse(txn, wallet.getId());
     }
 
     @Transactional
     public TransactionResponse transfer(UUID senderUserId,
                                         TransferRequest request,
                                         String idempotencyKey) {
-        // 1. idempotency check — if we've seen this key, return the original result
-        if (idempotencyKey != null) {
-            var existing = transactionRepository
-                    .findByIdempotencyKey(idempotencyKey);
-            if (existing.isPresent()) {
-                return toTransactionResponse(existing.get());
-            }
+
+        // 1. idempotency check — must happen before anything else
+        // but senderWallet doesn't exist yet, so we find the wallet separately
+        // just to get its ID for the response mapping
+        var existing = transactionRepository.findByIdempotencyKey(idempotencyKey);
+        if (existing.isPresent()) {
+            // we need the caller's wallet ID for direction mapping
+            // so look it up here — it's a simple read, no lock needed
+            Wallet callerWallet = getWalletByUserId(senderUserId);
+            return toTransactionResponse(existing.get(), callerWallet.getId());
         }
 
-        // 2. resolve sender and recipient
+        // 2. resolve sender and recipient users
         User sender = userRepository.findById(senderUserId)
                 .orElseThrow(() -> new WalletException("Sender not found",
                         HttpStatus.NOT_FOUND));
@@ -84,29 +87,25 @@ public class WalletService {
                     HttpStatus.BAD_REQUEST);
         }
 
-        // 3. lock both wallets — always lock in consistent ID order to prevent deadlock
-        UUID senderId = getWalletByUserId(sender.getId()).getId();
-        UUID recipientId = getWalletByUserId(recipient.getId()).getId();
+        // 3. get wallet IDs first — then lock in consistent UUID order
+        UUID senderWalletId    = getWalletByUserId(sender.getId()).getId();
+        UUID recipientWalletId = getWalletByUserId(recipient.getId()).getId();
 
         Wallet senderWallet, recipientWallet;
-        if (senderId.compareTo(recipientId) < 0) {
-            senderWallet = walletRepository.findByIdWithLock(senderId)
-                    .orElseThrow();
-            recipientWallet = walletRepository.findByIdWithLock(recipientId)
-                    .orElseThrow();
+        if (senderWalletId.compareTo(recipientWalletId) < 0) {
+            senderWallet    = walletRepository.findByIdWithLock(senderWalletId).orElseThrow();
+            recipientWallet = walletRepository.findByIdWithLock(recipientWalletId).orElseThrow();
         } else {
-            recipientWallet = walletRepository.findByIdWithLock(recipientId)
-                    .orElseThrow();
-            senderWallet = walletRepository.findByIdWithLock(senderId)
-                    .orElseThrow();
+            recipientWallet = walletRepository.findByIdWithLock(recipientWalletId).orElseThrow();
+            senderWallet    = walletRepository.findByIdWithLock(senderWalletId).orElseThrow();
         }
 
-        // 4. balance check
+        // 4. balance check — after lock, so balance is guaranteed current
         if (senderWallet.getBalance().compareTo(request.getAmount()) < 0) {
             throw new WalletException("Insufficient balance", HttpStatus.BAD_REQUEST);
         }
 
-        // 5. debit and credit
+        // 5. debit sender, credit recipient
         senderWallet.setBalance(
                 senderWallet.getBalance().subtract(request.getAmount()));
         recipientWallet.setBalance(
@@ -115,7 +114,7 @@ public class WalletService {
         walletRepository.save(senderWallet);
         walletRepository.save(recipientWallet);
 
-        // 6. record transaction
+        // 6. record the transaction
         Transaction txn = Transaction.builder()
                 .idempotencyKey(idempotencyKey)
                 .fromWallet(senderWallet)
@@ -127,16 +126,17 @@ public class WalletService {
                 .build();
 
         transactionRepository.save(txn);
-        return toTransactionResponse(txn);
+
+        // senderWallet.getId() — correct variable, exists at this point
+        return toTransactionResponse(txn, senderWallet.getId());
     }
 
     public List<TransactionResponse> getHistory(UUID userId) {
         Wallet wallet = getWalletByUserId(userId);
         return transactionRepository
-                .findByFromWalletIdOrToWalletIdOrderByCreatedAtDesc(
-                        wallet.getId(), wallet.getId())
+                .findByWalletIdWithDetails(wallet.getId())
                 .stream()
-                .map(this::toTransactionResponse)
+                .map(txn -> toTransactionResponse(txn, wallet.getId()))
                 .collect(Collectors.toList());
     }
 
@@ -156,7 +156,34 @@ public class WalletService {
                 .build();
     }
 
-    private TransactionResponse toTransactionResponse(Transaction txn) {
+    private TransactionResponse toTransactionResponse(Transaction txn,
+                                                      UUID callerWalletId) {
+        String counterpartyName  = null;
+        String counterpartyEmail = null;
+        String direction         = null;
+
+        if (txn.getType() == TransactionType.TRANSFER) {
+            boolean isSender = txn.getFromWallet().getId().equals(callerWalletId);
+
+            if (isSender) {
+                // caller sent money — counterparty is the recipient
+                counterpartyName  = txn.getToWallet().getUser().getName();
+                counterpartyEmail = txn.getToWallet().getUser().getEmail();
+                direction = "SENT";
+            } else {
+                // caller received money — counterparty is the sender
+                counterpartyName  = txn.getFromWallet().getUser().getName();
+                counterpartyEmail = txn.getFromWallet().getUser().getEmail();
+                direction = "RECEIVED";
+            }
+        } else if (txn.getType() == TransactionType.CREDIT) {
+            direction = "RECEIVED";
+            counterpartyName = "System";   // credited by the system, no real counterparty
+        } else if (txn.getType() == TransactionType.DEBIT) {
+            direction = "SENT";
+            counterpartyName = "System";
+        }
+
         return TransactionResponse.builder()
                 .transactionId(txn.getId())
                 .amount(txn.getAmount())
@@ -164,6 +191,9 @@ public class WalletService {
                 .status(txn.getStatus())
                 .description(txn.getDescription())
                 .createdAt(txn.getCreatedAt())
+                .counterpartyName(counterpartyName)
+                .counterpartyEmail(counterpartyEmail)
+                .direction(direction)
                 .build();
     }
 }

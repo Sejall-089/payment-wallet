@@ -3,6 +3,7 @@ package com.wallet.exception;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.MissingRequestHeaderException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
@@ -43,5 +44,14 @@ public class GlobalExceptionHandler {
         body.put("status", status.value());
         body.put("error", message);
         return ResponseEntity.status(status).body(body);
+    }
+
+    @ExceptionHandler(MissingRequestHeaderException.class)
+    public ResponseEntity<Map<String, Object>> handleMissingHeader(
+            MissingRequestHeaderException ex) {
+        String message = ex.getHeaderName().equals("Idempotency-Key")
+                ? "Idempotency-Key header is required for transfer requests"
+                : ex.getHeaderName() + " header is missing";
+        return buildResponse(HttpStatus.BAD_REQUEST, message);
     }
 }

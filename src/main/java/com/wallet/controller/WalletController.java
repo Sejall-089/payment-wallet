@@ -39,7 +39,7 @@ public class WalletController {
 
     @PostMapping("/transfer")
     public ResponseEntity<TransactionResponse> transfer(
-            @RequestHeader(value = "Idempotency-Key", required = false)
+            @RequestHeader(value = "Idempotency-Key")
             String idempotencyKey,
             @Valid @RequestBody TransferRequest request) {
         UUID userId = SecurityUtils.getCurrentUserId();

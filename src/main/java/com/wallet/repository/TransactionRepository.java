@@ -1,7 +1,9 @@
 package com.wallet.repository;
 
 import com.wallet.entity.Transaction;
+import io.lettuce.core.dynamic.annotation.Param;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
@@ -16,4 +18,13 @@ public interface TransactionRepository extends JpaRepository<Transaction, UUID> 
     List<Transaction> findByFromWalletIdOrToWalletIdOrderByCreatedAtDesc(
             UUID fromWalletId, UUID toWalletId
     );
+
+    @Query("SELECT t FROM Transaction t " +
+            "LEFT JOIN FETCH t.fromWallet fw " +
+            "LEFT JOIN FETCH fw.user " +
+            "LEFT JOIN FETCH t.toWallet tw " +
+            "LEFT JOIN FETCH tw.user " +
+            "WHERE (t.fromWallet.id = :walletId OR t.toWallet.id = :walletId) " +
+            "ORDER BY t.createdAt DESC")
+    List<Transaction> findByWalletIdWithDetails(@Param("walletId") UUID walletId);
 }

@@ -19,4 +19,8 @@ public class TransactionResponse {
     private TransactionStatus status;
     private String description;
     private LocalDateTime createdAt;
+
+    private String counterpartyName;   // their display name
+    private String counterpartyEmail;  // their email
+    private String direction;          // "SENT" or "RECEIVED" — from caller's perspective
 }
