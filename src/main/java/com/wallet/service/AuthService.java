@@ -8,6 +8,7 @@ import com.wallet.entity.Wallet;
 import com.wallet.exception.WalletException;
 import com.wallet.repository.UserRepository;
 import com.wallet.repository.WalletRepository;
+import com.wallet.util.JwtUtil;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
@@ -23,6 +24,7 @@ public class AuthService {
     private final UserRepository userRepository;
     private final WalletRepository walletRepository;
     private final BCryptPasswordEncoder passwordEncoder;
+    private final JwtUtil jwtUtil;
 
     @Transactional
     public AuthResponse register(RegisterRequest request) {
@@ -49,7 +51,7 @@ public class AuthService {
 
         // token will be "dummy" for now — Day 3 replaces this
         return AuthResponse.builder()
-                .token("jwt-coming-on-day3")
+                .token(jwtUtil.generateToken(user.getId(), user.getEmail()))
                 .email(user.getEmail())
                 .name(user.getName())
                 .build();
@@ -65,7 +67,7 @@ public class AuthService {
         }
 
         return AuthResponse.builder()
-                .token("jwt-coming-on-day3")
+                .token(jwtUtil.generateToken(user.getId(), user.getEmail()))
                 .email(user.getEmail())
                 .name(user.getName())
                 .build();
