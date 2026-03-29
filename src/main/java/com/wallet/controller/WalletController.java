@@ -4,14 +4,14 @@ import com.wallet.dto.request.TransferRequest;
 import com.wallet.dto.response.TransactionResponse;
 import com.wallet.dto.response.WalletResponse;
 import com.wallet.exception.RateLimitException;
+import com.wallet.exception.WalletException;
 import com.wallet.service.RateLimiterService;
 import com.wallet.service.WalletService;
-import com.wallet.util.CacheConstants;
 import com.wallet.util.SecurityUtils;
+import io.micrometer.core.instrument.Counter;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
-import org.springframework.cache.CacheManager;
-import org.springframework.data.redis.core.StringRedisTemplate;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -19,29 +19,17 @@ import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
 
+@Slf4j
 @RestController
 @RequestMapping("/api/wallet")
 @RequiredArgsConstructor
 public class WalletController {
 
     private final WalletService walletService;
-
-    private final StringRedisTemplate redisTemplate;
-
     private final RateLimiterService rateLimiterService;
+    private final Counter transferFailureCounter;
+    private final Counter rateLimitHitCounter;
 
-    @GetMapping("/redis-ping")
-    public ResponseEntity<String> redisPing() {
-        try {
-            redisTemplate.opsForValue().set("ping", "pong");
-            String val = redisTemplate.opsForValue().get("ping");
-            return ResponseEntity.ok("Redis working: " + val);
-        } catch (Exception e) {
-            return ResponseEntity.status(500).body("Redis error: " + e.getMessage());
-        }
-    }
-
-    // temporary: userId passed as header until JWT is wired on Day 3
     @GetMapping("/balance")
     public ResponseEntity<WalletResponse> getBalance() {
         UUID userId = SecurityUtils.getCurrentUserId();
@@ -59,19 +47,25 @@ public class WalletController {
 
     @PostMapping("/transfer")
     public ResponseEntity<TransactionResponse> transfer(
-            @RequestHeader(value = "Idempotency-Key")
-            String idempotencyKey,
+            @RequestHeader(value = "Idempotency-Key") String idempotencyKey,
             @Valid @RequestBody TransferRequest request) {
+
         UUID userId = SecurityUtils.getCurrentUserId();
 
-        // check rate limit before doing any business logic
         if (!rateLimiterService.isAllowed(userId)) {
+            rateLimitHitCounter.increment();
+            log.warn("Rate limit exceeded | userId: {}", userId);
             throw new RateLimitException(
                     "Transfer rate limit exceeded. Maximum 5 transfers per minute.");
         }
 
-        return ResponseEntity.ok(
-                walletService.transfer(userId, request, idempotencyKey));
+        try {
+            return ResponseEntity.ok(
+                    walletService.transfer(userId, request, idempotencyKey));
+        } catch (WalletException e) {
+            transferFailureCounter.increment();
+            throw e;
+        }
     }
 
     @GetMapping("/transactions")

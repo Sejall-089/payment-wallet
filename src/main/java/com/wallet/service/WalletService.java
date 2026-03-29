@@ -14,13 +14,10 @@ import com.wallet.exception.WalletException;
 import com.wallet.repository.TransactionRepository;
 import com.wallet.repository.UserRepository;
 import com.wallet.repository.WalletRepository;
-import com.wallet.util.CacheConstants;
+import io.micrometer.core.instrument.Counter;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
-import org.springframework.cache.annotation.CacheEvict;
-import org.springframework.cache.annotation.Cacheable;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
@@ -31,6 +28,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class WalletService {
@@ -39,6 +37,7 @@ public class WalletService {
     private final UserRepository userRepository;
     private final TransactionRepository transactionRepository;
     private final TransactionEventPublisher eventPublisher;
+    private final Counter transferSuccessCounter;
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
@@ -46,17 +45,17 @@ public class WalletService {
     @Autowired
     private ObjectMapper objectMapper;
 
-
     public WalletResponse getBalance(UUID userId) {
         String cacheKey = "walletBalance::" + userId.toString();
 
         try {
             String cached = stringRedisTemplate.opsForValue().get(cacheKey);
             if (cached != null) {
+                log.debug("Cache hit for balance | userId: {}", userId);
                 return objectMapper.readValue(cached, WalletResponse.class);
             }
         } catch (Exception e) {
-            // cache read failed — fall through to DB
+            log.warn("Cache read failed for userId: {} | reason: {}", userId, e.getMessage());
         }
 
         Wallet wallet = getWalletByUserId(userId);
@@ -65,8 +64,9 @@ public class WalletService {
         try {
             String json = objectMapper.writeValueAsString(response);
             stringRedisTemplate.opsForValue().set(cacheKey, json, 10, TimeUnit.MINUTES);
+            log.debug("Balance cached for userId: {}", userId);
         } catch (Exception e) {
-            // cache write failed — DB still served the response
+            log.warn("Cache write failed for userId: {} | reason: {}", userId, e.getMessage());
         }
 
         return response;
@@ -92,9 +92,10 @@ public class WalletService {
                 .build();
 
         transactionRepository.save(txn);
-
-        // evict cache — balance changed
         evictBalanceCache(userId);
+
+        log.info("Credit completed | userId: {} | amount: {} | txnId: {}",
+                userId, amount, txn.getId());
 
         return toTransactionResponse(txn, wallet.getId());
     }
@@ -104,18 +105,19 @@ public class WalletService {
                                         TransferRequest request,
                                         String idempotencyKey) {
 
-        // 1. idempotency check — must happen before anything else
-        // but senderWallet doesn't exist yet, so we find the wallet separately
-        // just to get its ID for the response mapping
+        // 1. idempotency check
         var existing = transactionRepository.findByIdempotencyKey(idempotencyKey);
         if (existing.isPresent()) {
-            // we need the caller's wallet ID for direction mapping
-            // so look it up here — it's a simple read, no lock needed
+            log.info("Duplicate transfer request | idempotencyKey: {} | returning existing txn",
+                    idempotencyKey);
             Wallet callerWallet = getWalletByUserId(senderUserId);
             return toTransactionResponse(existing.get(), callerWallet.getId());
         }
 
-        // 2. resolve sender and recipient users
+        log.info("Transfer initiated | sender: {} | recipient: {} | amount: {}",
+                senderUserId, request.getToEmail(), request.getAmount());
+
+        // 2. resolve sender and recipient
         User sender = userRepository.findById(senderUserId)
                 .orElseThrow(() -> new WalletException("Sender not found",
                         HttpStatus.NOT_FOUND));
@@ -129,7 +131,7 @@ public class WalletService {
                     HttpStatus.BAD_REQUEST);
         }
 
-        // 3. get wallet IDs first — then lock in consistent UUID order
+        // 3. lock in consistent UUID order
         UUID senderWalletId    = getWalletByUserId(sender.getId()).getId();
         UUID recipientWalletId = getWalletByUserId(recipient.getId()).getId();
 
@@ -142,12 +144,14 @@ public class WalletService {
             senderWallet    = walletRepository.findByIdWithLock(senderWalletId).orElseThrow();
         }
 
-        // 4. balance check — after lock, so balance is guaranteed current
+        // 4. balance check
         if (senderWallet.getBalance().compareTo(request.getAmount()) < 0) {
+            log.warn("Insufficient balance | userId: {} | balance: {} | requested: {}",
+                    senderUserId, senderWallet.getBalance(), request.getAmount());
             throw new WalletException("Insufficient balance", HttpStatus.BAD_REQUEST);
         }
 
-        // 5. debit sender, credit recipient
+        // 5. debit and credit
         senderWallet.setBalance(
                 senderWallet.getBalance().subtract(request.getAmount()));
         recipientWallet.setBalance(
@@ -156,7 +160,7 @@ public class WalletService {
         walletRepository.save(senderWallet);
         walletRepository.save(recipientWallet);
 
-        // 6. record the transaction
+        // 6. record transaction
         Transaction txn = Transaction.builder()
                 .idempotencyKey(idempotencyKey)
                 .fromWallet(senderWallet)
@@ -169,9 +173,10 @@ public class WalletService {
 
         transactionRepository.save(txn);
 
+        // 7. evict cache for both wallets
         evictBalanceCache(senderUserId, recipient.getId());
-        // senderWallet.getId() — correct variable, exists at this point
 
+        // 8. publish Kafka event
         TransactionEvent event = TransactionEvent.builder()
                 .transactionId(txn.getId())
                 .senderUserId(senderUserId)
@@ -186,6 +191,12 @@ public class WalletService {
 
         eventPublisher.publishTransactionEvent(event);
 
+        // 9. increment success metric
+        transferSuccessCounter.increment();
+
+        log.info("Transfer completed | txnId: {} | amount: {} | from: {} | to: {}",
+                txn.getId(), request.getAmount(),
+                sender.getEmail(), recipient.getEmail());
 
         return toTransactionResponse(txn, senderWallet.getId());
     }
@@ -223,21 +234,18 @@ public class WalletService {
 
         if (txn.getType() == TransactionType.TRANSFER) {
             boolean isSender = txn.getFromWallet().getId().equals(callerWalletId);
-
             if (isSender) {
-                // caller sent money — counterparty is the recipient
                 counterpartyName  = txn.getToWallet().getUser().getName();
                 counterpartyEmail = txn.getToWallet().getUser().getEmail();
                 direction = "SENT";
             } else {
-                // caller received money — counterparty is the sender
                 counterpartyName  = txn.getFromWallet().getUser().getName();
                 counterpartyEmail = txn.getFromWallet().getUser().getEmail();
                 direction = "RECEIVED";
             }
         } else if (txn.getType() == TransactionType.CREDIT) {
             direction = "RECEIVED";
-            counterpartyName = "System";   // credited by the system, no real counterparty
+            counterpartyName = "System";
         } else if (txn.getType() == TransactionType.DEBIT) {
             direction = "SENT";
             counterpartyName = "System";
@@ -258,11 +266,8 @@ public class WalletService {
 
     private void evictBalanceCache(UUID... userIds) {
         for (UUID userId : userIds) {
-            String cacheKey = "walletBalance::" + userId.toString();
-            stringRedisTemplate.delete(cacheKey);
-            System.out.println(">>> Evicted cache for: " + userId);
+            stringRedisTemplate.delete("walletBalance::" + userId.toString());
+            log.debug("Balance cache evicted for userId: {}", userId);
         }
     }
-
-
 }
