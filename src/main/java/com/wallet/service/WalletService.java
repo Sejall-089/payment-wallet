@@ -9,6 +9,7 @@ import com.wallet.entity.User;
 import com.wallet.entity.Wallet;
 import com.wallet.entity.enums.TransactionStatus;
 import com.wallet.entity.enums.TransactionType;
+import com.wallet.event.TransactionEvent;
 import com.wallet.exception.WalletException;
 import com.wallet.repository.TransactionRepository;
 import com.wallet.repository.UserRepository;
@@ -37,6 +38,7 @@ public class WalletService {
     private final WalletRepository walletRepository;
     private final UserRepository userRepository;
     private final TransactionRepository transactionRepository;
+    private final TransactionEventPublisher eventPublisher;
 
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
@@ -169,6 +171,22 @@ public class WalletService {
 
         evictBalanceCache(senderUserId, recipient.getId());
         // senderWallet.getId() — correct variable, exists at this point
+
+        TransactionEvent event = TransactionEvent.builder()
+                .transactionId(txn.getId())
+                .senderUserId(senderUserId)
+                .senderEmail(sender.getEmail())
+                .recipientUserId(recipient.getId())
+                .recipientEmail(recipient.getEmail())
+                .amount(request.getAmount())
+                .type(TransactionType.TRANSFER)
+                .description(request.getDescription())
+                .occurredAt(txn.getCreatedAt())
+                .build();
+
+        eventPublisher.publishTransactionEvent(event);
+
+
         return toTransactionResponse(txn, senderWallet.getId());
     }
 
