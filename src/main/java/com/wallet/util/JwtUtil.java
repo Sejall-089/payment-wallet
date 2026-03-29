@@ -19,6 +19,7 @@ public class JwtUtil {
     // reads values from application.yml — never hardcode secrets in Java
     public JwtUtil(@Value("${app.jwt.secret}") String secret,
                    @Value("${app.jwt.expiration-ms}") long expirationMs) {
+        System.out.println(">>> JwtUtil created with secret length: " + secret.length());
         this.secretKey = Keys.hmacShaKeyFor(secret.getBytes());
         this.expirationMs = expirationMs;
     }

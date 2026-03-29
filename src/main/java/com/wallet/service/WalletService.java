@@ -1,5 +1,6 @@
 package com.wallet.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wallet.dto.request.TransferRequest;
 import com.wallet.dto.response.TransactionResponse;
 import com.wallet.dto.response.WalletResponse;
@@ -12,13 +13,21 @@ import com.wallet.exception.WalletException;
 import com.wallet.repository.TransactionRepository;
 import com.wallet.repository.UserRepository;
 import com.wallet.repository.WalletRepository;
+import com.wallet.util.CacheConstants;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Service
@@ -29,9 +38,36 @@ public class WalletService {
     private final UserRepository userRepository;
     private final TransactionRepository transactionRepository;
 
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
+
+    @Autowired
+    private ObjectMapper objectMapper;
+
+
     public WalletResponse getBalance(UUID userId) {
+        String cacheKey = "walletBalance::" + userId.toString();
+
+        try {
+            String cached = stringRedisTemplate.opsForValue().get(cacheKey);
+            if (cached != null) {
+                return objectMapper.readValue(cached, WalletResponse.class);
+            }
+        } catch (Exception e) {
+            // cache read failed — fall through to DB
+        }
+
         Wallet wallet = getWalletByUserId(userId);
-        return toWalletResponse(wallet);
+        WalletResponse response = toWalletResponse(wallet);
+
+        try {
+            String json = objectMapper.writeValueAsString(response);
+            stringRedisTemplate.opsForValue().set(cacheKey, json, 10, TimeUnit.MINUTES);
+        } catch (Exception e) {
+            // cache write failed — DB still served the response
+        }
+
+        return response;
     }
 
     @Transactional
@@ -54,6 +90,10 @@ public class WalletService {
                 .build();
 
         transactionRepository.save(txn);
+
+        // evict cache — balance changed
+        evictBalanceCache(userId);
+
         return toTransactionResponse(txn, wallet.getId());
     }
 
@@ -127,6 +167,7 @@ public class WalletService {
 
         transactionRepository.save(txn);
 
+        evictBalanceCache(senderUserId, recipient.getId());
         // senderWallet.getId() — correct variable, exists at this point
         return toTransactionResponse(txn, senderWallet.getId());
     }
@@ -196,4 +237,14 @@ public class WalletService {
                 .direction(direction)
                 .build();
     }
+
+    private void evictBalanceCache(UUID... userIds) {
+        for (UUID userId : userIds) {
+            String cacheKey = "walletBalance::" + userId.toString();
+            stringRedisTemplate.delete(cacheKey);
+            System.out.println(">>> Evicted cache for: " + userId);
+        }
+    }
+
+
 }

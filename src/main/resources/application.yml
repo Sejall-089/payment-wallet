@@ -18,7 +18,7 @@ spring:
 
   jpa:
     hibernate:
-      ddl-auto: validate        # Flyway owns the schema, not Hibernate
+      ddl-auto: validate
     show-sql: false
     properties:
       hibernate:
@@ -26,6 +26,7 @@ spring:
           time_zone: Asia/Kolkata
         dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: true
+    open-in-view: false
 
   flyway:
     enabled: true
@@ -50,10 +51,19 @@ spring:
       properties:
         spring.json.trusted.packages: "com.wallet.*"
 
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.data.redis.RedisRepositoriesAutoConfiguration
+
+
 app:
   jwt:
     secret: "your-256-bit-secret-key-replace-this-in-prod-env"
-    expiration-ms: 86400000   # 24 hours
+    expiration-ms: 86400000
 
 server:
   port: 8080
+
+logging:
+  level:
+    org.springframework.cache: TRACE

@@ -4,9 +4,12 @@ import com.wallet.dto.request.TransferRequest;
 import com.wallet.dto.response.TransactionResponse;
 import com.wallet.dto.response.WalletResponse;
 import com.wallet.service.WalletService;
+import com.wallet.util.CacheConstants;
 import com.wallet.util.SecurityUtils;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.CacheManager;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
@@ -20,6 +23,19 @@ import java.util.UUID;
 public class WalletController {
 
     private final WalletService walletService;
+
+    private final StringRedisTemplate redisTemplate;
+
+    @GetMapping("/redis-ping")
+    public ResponseEntity<String> redisPing() {
+        try {
+            redisTemplate.opsForValue().set("ping", "pong");
+            String val = redisTemplate.opsForValue().get("ping");
+            return ResponseEntity.ok("Redis working: " + val);
+        } catch (Exception e) {
+            return ResponseEntity.status(500).body("Redis error: " + e.getMessage());
+        }
+    }
 
     // temporary: userId passed as header until JWT is wired on Day 3
     @GetMapping("/balance")
