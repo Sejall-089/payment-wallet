@@ -3,6 +3,8 @@ package com.wallet.controller;
 import com.wallet.dto.request.TransferRequest;
 import com.wallet.dto.response.TransactionResponse;
 import com.wallet.dto.response.WalletResponse;
+import com.wallet.exception.RateLimitException;
+import com.wallet.service.RateLimiterService;
 import com.wallet.service.WalletService;
 import com.wallet.util.CacheConstants;
 import com.wallet.util.SecurityUtils;
@@ -25,6 +27,8 @@ public class WalletController {
     private final WalletService walletService;
 
     private final StringRedisTemplate redisTemplate;
+
+    private final RateLimiterService rateLimiterService;
 
     @GetMapping("/redis-ping")
     public ResponseEntity<String> redisPing() {
@@ -59,6 +63,13 @@ public class WalletController {
             String idempotencyKey,
             @Valid @RequestBody TransferRequest request) {
         UUID userId = SecurityUtils.getCurrentUserId();
+
+        // check rate limit before doing any business logic
+        if (!rateLimiterService.isAllowed(userId)) {
+            throw new RateLimitException(
+                    "Transfer rate limit exceeded. Maximum 5 transfers per minute.");
+        }
+
         return ResponseEntity.ok(
                 walletService.transfer(userId, request, idempotencyKey));
     }

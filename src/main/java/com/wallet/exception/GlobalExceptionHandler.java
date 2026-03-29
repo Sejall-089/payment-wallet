@@ -54,4 +54,9 @@ public class GlobalExceptionHandler {
                 : ex.getHeaderName() + " header is missing";
         return buildResponse(HttpStatus.BAD_REQUEST, message);
     }
+
+    @ExceptionHandler(RateLimitException.class)
+    public ResponseEntity<Map<String, Object>> handleRateLimit(RateLimitException ex) {
+        return buildResponse(HttpStatus.TOO_MANY_REQUESTS, ex.getMessage());
+    }
 }
