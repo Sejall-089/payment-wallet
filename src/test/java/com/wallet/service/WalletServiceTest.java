@@ -1,5 +1,6 @@
 package com.wallet.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wallet.dto.request.TransferRequest;
 import com.wallet.dto.response.TransactionResponse;
 import com.wallet.dto.response.WalletResponse;
@@ -12,16 +13,15 @@ import com.wallet.exception.WalletException;
 import com.wallet.repository.TransactionRepository;
 import com.wallet.repository.UserRepository;
 import com.wallet.repository.WalletRepository;
+import io.micrometer.core.instrument.Counter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.mockito.junit.jupiter.MockitoSettings;
-import org.mockito.quality.Strictness;
-import org.springframework.cache.Cache;
-import org.springframework.cache.CacheManager;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ValueOperations;
 
 import java.math.BigDecimal;
 import java.util.Optional;
@@ -29,18 +29,19 @@ import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
-@MockitoSettings(strictness = Strictness.LENIENT) // ✅ fix unnecessary stubbing
 class WalletServiceTest {
 
     @Mock private WalletRepository walletRepository;
     @Mock private UserRepository userRepository;
     @Mock private TransactionRepository transactionRepository;
-
-    @Mock private CacheManager cacheManager;
-    @Mock private Cache cache;
+    @Mock private TransactionEventPublisher eventPublisher;
+    @Mock private Counter transferSuccessCounter;
+    @Mock private StringRedisTemplate stringRedisTemplate;
+    @Mock private ObjectMapper objectMapper;
 
     @InjectMocks private WalletService walletService;
 
@@ -51,10 +52,6 @@ class WalletServiceTest {
 
     @BeforeEach
     void setUp() {
-        // ✅ FIX: mock cache manager + evict
-        when(cacheManager.getCache(anyString())).thenReturn(cache);
-        doNothing().when(cache).evict(any());
-
         sender = User.builder()
                 .id(UUID.randomUUID())
                 .name("Rahul")
@@ -82,6 +79,17 @@ class WalletServiceTest {
                 .balance(new BigDecimal("500.0000"))
                 .currency("INR")
                 .build();
+
+        // stub Redis — unit tests don't use real Redis
+        ValueOperations<String, String> valueOps = mock(ValueOperations.class);
+        lenient().when(stringRedisTemplate.opsForValue()).thenReturn(valueOps);
+        lenient().when(valueOps.get(anyString())).thenReturn(null); // always cache miss
+        lenient().when(stringRedisTemplate.delete(anyString())).thenReturn(true);
+
+        // stub ObjectMapper
+        try {
+            lenient().when(objectMapper.writeValueAsString(any())).thenReturn("{}");
+        } catch (Exception ignored) {}
     }
 
     // --- getBalance ---
@@ -119,22 +127,18 @@ class WalletServiceTest {
 
         when(transactionRepository.findByIdempotencyKey("key-001"))
                 .thenReturn(Optional.empty());
-
         when(userRepository.findById(sender.getId()))
                 .thenReturn(Optional.of(sender));
         when(userRepository.findByEmail("priya@test.com"))
                 .thenReturn(Optional.of(recipient));
-
         when(walletRepository.findByUserId(sender.getId()))
                 .thenReturn(Optional.of(senderWallet));
         when(walletRepository.findByUserId(recipient.getId()))
                 .thenReturn(Optional.of(recipientWallet));
-
         when(walletRepository.findByIdWithLock(senderWallet.getId()))
                 .thenReturn(Optional.of(senderWallet));
         when(walletRepository.findByIdWithLock(recipientWallet.getId()))
                 .thenReturn(Optional.of(recipientWallet));
-
         when(walletRepository.save(any())).thenAnswer(i -> i.getArgument(0));
         when(transactionRepository.save(any())).thenAnswer(i -> {
             Transaction t = i.getArgument(0);
@@ -154,22 +158,19 @@ class WalletServiceTest {
                 sender.getId(), request, "key-001");
 
         assertThat(senderWallet.getBalance())
-                .isEqualByComparingTo("700.0000");
+                .isEqualByComparingTo(new BigDecimal("700.0000"));
         assertThat(recipientWallet.getBalance())
-                .isEqualByComparingTo("800.0000");
+                .isEqualByComparingTo(new BigDecimal("800.0000"));
+        assertThat(response.getDirection()).isEqualTo("SENT");
+        assertThat(response.getCounterpartyName()).isEqualTo("Priya");
 
         verify(walletRepository, times(2)).save(any());
         verify(transactionRepository).save(any());
+        verify(transferSuccessCounter).increment();
     }
 
     @Test
     void transfer_throwsWhenInsufficientBalance() {
-        when(walletRepository.findByIdWithLock(senderWallet.getId()))
-                .thenReturn(Optional.of(senderWallet));
-
-        when(walletRepository.findByIdWithLock(recipientWallet.getId()))
-                .thenReturn(Optional.of(recipientWallet));
-
         TransferRequest request = new TransferRequest();
         request.setToEmail("priya@test.com");
         request.setAmount(new BigDecimal("9999.0000"));
@@ -184,12 +185,19 @@ class WalletServiceTest {
                 .thenReturn(Optional.of(senderWallet));
         when(walletRepository.findByUserId(recipient.getId()))
                 .thenReturn(Optional.of(recipientWallet));
+        when(walletRepository.findByIdWithLock(senderWallet.getId()))
+                .thenReturn(Optional.of(senderWallet));
+        when(walletRepository.findByIdWithLock(recipientWallet.getId()))
+                .thenReturn(Optional.of(recipientWallet));
 
         assertThatThrownBy(() ->
                 walletService.transfer(sender.getId(), request, "key-002"))
-                .isInstanceOf(WalletException.class);
+                .isInstanceOf(WalletException.class)
+                .hasMessageContaining("Insufficient balance");
 
         verify(walletRepository, never()).save(any());
+        verify(transactionRepository, never()).save(any());
+        verify(transferSuccessCounter, never()).increment();
     }
 
     @Test
@@ -207,7 +215,8 @@ class WalletServiceTest {
 
         assertThatThrownBy(() ->
                 walletService.transfer(sender.getId(), request, "key-003"))
-                .isInstanceOf(WalletException.class);
+                .isInstanceOf(WalletException.class)
+                .hasMessageContaining("Cannot transfer to yourself");
 
         verify(walletRepository, never()).save(any());
     }
@@ -233,8 +242,8 @@ class WalletServiceTest {
                 sender.getId(), new TransferRequest(), "duplicate-key");
 
         assertThat(response.getTransactionId()).isEqualTo(existing.getId());
-
         verify(walletRepository, never()).save(any());
         verify(transactionRepository, never()).save(any());
+        verify(transferSuccessCounter, never()).increment();
     }
 }

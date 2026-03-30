@@ -39,11 +39,9 @@ public class WalletService {
     private final TransactionEventPublisher eventPublisher;
     private final Counter transferSuccessCounter;
 
-    @Autowired
-    private StringRedisTemplate stringRedisTemplate;
 
-    @Autowired
-    private ObjectMapper objectMapper;
+    private final StringRedisTemplate stringRedisTemplate;
+    private final ObjectMapper objectMapper;
 
     public WalletResponse getBalance(UUID userId) {
         String cacheKey = "walletBalance::" + userId.toString();
